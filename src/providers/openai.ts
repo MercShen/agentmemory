@@ -13,6 +13,23 @@ const DEFAULT_MODEL = "gpt-5.6-luna";
 const DEFAULT_TIMEOUT_MS = 60_000;
 
 /**
+ * Models served by OpenAI's own chat surface reject `max_tokens` and require
+ * `max_completion_tokens`; OpenAI-compatible endpoints (DeepSeek, Qwen, vLLM,
+ * Ollama, …) only accept `max_tokens`. A 400 from the wrong field blocks every
+ * memory write, so the field is chosen per model and overridable.
+ */
+const COMPLETION_TOKEN_MODEL = /^(chatgpt-|o[0-9]|gpt-[5-9])/i;
+
+export type TokenLimitField = "max_tokens" | "max_completion_tokens";
+
+/** @returns the output-token field this provider should send for `model`. */
+export function tokenLimitField(model: string, override?: string | null): TokenLimitField {
+  const explicit = override?.trim().toLowerCase();
+  if (explicit === "max_tokens" || explicit === "max_completion_tokens") return explicit;
+  return COMPLETION_TOKEN_MODEL.test(model) ? "max_completion_tokens" : "max_tokens";
+}
+
+/**
  * OpenAI-compatible LLM provider.
  *
  * Uses raw fetch (no SDK) to support any OpenAI-compatible endpoint:
@@ -38,6 +55,9 @@ const DEFAULT_TIMEOUT_MS = 60_000;
  *                              raw-fetch LLM + embedding providers. Used when
  *                              OPENAI_TIMEOUT_MS is not set. Default: 60000.
  *   MAX_TOKENS               — max output tokens (default: from config or 4096)
+ *   OPENAI_TOKEN_LIMIT_FIELD — "max_tokens" | "max_completion_tokens". Forces the
+ *                              output-token field for endpoints whose model name
+ *                              does not reveal the expected one.
  *   OPENAI_REASONING_EFFORT  — "low" | "medium" | "high" | "none"
  *                              Passthrough for reasoning models (e.g. Ollama Cloud
  *                              thinking models). Set to "none" to ensure
@@ -54,6 +74,7 @@ export class OpenAIProvider implements MemoryProvider {
   private timeoutMs: number;
   private isAzure: boolean;
   private azureApiVersion: string;
+  private tokenField: TokenLimitField;
 
   constructor(apiKey: string, model: string, maxTokens: number, baseURL?: string) {
     this.apiKey = apiKey;
@@ -65,6 +86,7 @@ export class OpenAIProvider implements MemoryProvider {
     this.azureApiVersion =
       getEnvVar("OPENAI_API_VERSION") || DEFAULT_AZURE_API_VERSION;
     this.isAzure = detectAzure(this.baseUrl);
+    this.tokenField = tokenLimitField(model, getEnvVar("OPENAI_TOKEN_LIMIT_FIELD"));
   }
 
   async compress(systemPrompt: string, userPrompt: string): Promise<string> {
@@ -79,7 +101,7 @@ export class OpenAIProvider implements MemoryProvider {
     const url = buildChatUrl(this.baseUrl, this.isAzure, this.azureApiVersion);
     const body: Record<string, unknown> = {
       model: this.model,
-      max_tokens: this.maxTokens,
+      [this.tokenField]: this.maxTokens,
       stream: false,
       messages: [
         { role: "system", content: systemPrompt },
@@ -103,7 +125,13 @@ export class OpenAIProvider implements MemoryProvider {
 
       if (!response.ok) {
         const text = await response.text();
-        throw new Error(`OpenAI API error (${response.status}): ${text}`);
+        const hint =
+          response.status === 400 && /max_(completion_)?tokens/i.test(text)
+            ? ` The endpoint rejected "${this.tokenField}"; set OPENAI_TOKEN_LIMIT_FIELD to "${
+                this.tokenField === "max_tokens" ? "max_completion_tokens" : "max_tokens"
+              }" for this model.`
+            : "";
+        throw new Error(`OpenAI API error (${response.status}): ${text}${hint}`);
       }
 
       const data = (await response.json()) as {
@@ -120,7 +148,7 @@ export class OpenAIProvider implements MemoryProvider {
       }
       if (choice?.finish_reason === "length") {
         throw new Error(
-          `OpenAI response hit max_tokens (${this.maxTokens}) before any content. Raise MAX_TOKENS or lower OPENAI_REASONING_EFFORT.`,
+          `OpenAI response hit ${this.tokenField} (${this.maxTokens}) before any content. Raise MAX_TOKENS or lower OPENAI_REASONING_EFFORT.`,
         );
       }
       const reasoning = message?.reasoning ?? message?.reasoning_content;
@@ -167,4 +195,3 @@ function parsePositiveInt(raw: string | null | undefined): number | undefined {
   const n = Number(trimmed);
   return Number.isFinite(n) && n > 0 ? n : undefined;
 }
-
